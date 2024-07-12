@@ -1,13 +1,21 @@
+/*
+how to run this
+
+gcc -o malloc malloc.c -lpthread
+./malloc
+*/
+
 #include <stddef.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 #define ALIGNMENT 8
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
-#define POOL_SIZE 1024 * 1024 // 1 MB
+#define POOL_SIZE (1024 * 1024) // 1 MB
 
 typedef struct Header {
     size_t size;
@@ -25,7 +33,18 @@ typedef struct {
 
 static memory_pool_t global_pool = {NULL, NULL, 0, 0};
 static pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t pool_initialized = PTHREAD_ONCE_INIT;
 static void* pool_start = NULL;
+
+void initialize_memory_pool() {
+    pool_start = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (pool_start == MAP_FAILED) {
+        pool_start = NULL;
+        fprintf(stderr, "Memory pool initialization failed\n");
+        exit(EXIT_FAILURE);
+    }
+    printf("Memory pool initialized at %p\n", pool_start);
+}
 
 void add_to_free_list(header_t* block) {
     block->is_free = 1;
@@ -96,6 +115,8 @@ void* malloc(size_t size) {
         return NULL;
     }
 
+    pthread_once(&pool_initialized, initialize_memory_pool);
+
     size = ALIGN(size);
     pthread_mutex_lock(&global_malloc_lock);
     header = get_free_block(size);
@@ -107,17 +128,12 @@ void* malloc(size_t size) {
     }
 
     total_size = size + sizeof(header_t);
-    if (!pool_start || (char*)sbrk(0) - (char*)pool_start + total_size > POOL_SIZE) {
+    if (!pool_start || (char*)pool_start + POOL_SIZE - (char*)global_pool.tail - total_size < 0) {
         pthread_mutex_unlock(&global_malloc_lock);
         return NULL;
     }
 
-    header = sbrk(total_size);
-    if (header == (void*) -1) {
-        pthread_mutex_unlock(&global_malloc_lock);
-        return NULL;
-    }
-
+    header = (header_t*)((char*)pool_start + global_pool.allocated_memory);
     header->size = size;
     header->next = NULL;
     header->prev = NULL;
@@ -131,7 +147,7 @@ void* malloc(size_t size) {
         global_pool.head = global_pool.tail = header;
     }
 
-    global_pool.allocated_memory += size;
+    global_pool.allocated_memory += total_size;
     block = (void*)(header + 1);
     pthread_mutex_unlock(&global_malloc_lock);
     return block;
@@ -168,10 +184,12 @@ void free(void* block) {
         return;
     }
 
+    pthread_once(&pool_initialized, initialize_memory_pool);
+
     pthread_mutex_lock(&global_malloc_lock);
     header = (header_t*)block - 1;
 
-    programbreak = sbrk(0);
+    programbreak = (char*)pool_start + POOL_SIZE;
     if ((char*)block + header->size == programbreak) {
         if (global_pool.head == global_pool.tail) {
             global_pool.head = global_pool.tail = NULL;
@@ -183,7 +201,6 @@ void free(void* block) {
             tmp->next = NULL;
             global_pool.tail = tmp;
         }
-        sbrk(0 - sizeof(header_t) - header->size);
     } else {
         add_to_free_list(header);
         coalesce_free_blocks();
@@ -235,71 +252,31 @@ void print_free_list() {
     }
 }
 
-void initialize_memory_pool() {
-    pthread_mutex_lock(&global_malloc_lock);
-    if (!pool_start) {
-        pool_start = sbrk(POOL_SIZE);
-        if (pool_start == (void*)-1) {
-            pool_start = NULL;
-        }
-    }
-    pthread_mutex_unlock(&global_malloc_lock);
+void print_pool_status() {
+    printf("Memory pool starts at: %p\n", pool_start);
+    printf("Memory pool ends at: %p\n", (char*)pool_start + POOL_SIZE);
+    printf("Total pool size: %d bytes\n", POOL_SIZE);
 }
 
-/*
-test program 1
-
+// Test program 1
 int main() {
+    printf("Initializing memory pool...\n");
     initialize_memory_pool();
+    print_pool_status();
+
     int* arr = (int*)malloc(10 * sizeof(int));
     if (arr) {
+        printf("Allocated array at %p\n", arr);
         for (int i = 0; i < 10; i++) {
             arr[i] = i;
         }
         free(arr);
+        printf("Freed array at %p\n", arr);
     }
+
     print_memory_usage();
     print_free_list();
+    print_pool_status();
+
     return 0;
 }
-*/
-
-/*
-test program 2
-
-#include <stdio.h>
-#include <stdlib.h>
-
-int main() {
-    int *arr1 = (int *)malloc(5 * sizeof(int));
-    for (int i = 0; i < 5; ++i) {
-        arr1[i] = i * 2;
-    }
-    printf("Array 1: ");
-    for (int i = 0; i < 5; ++i) {
-        printf("%d ", arr1[i]);
-    }
-    printf("\n");
-    free(arr1);
-    int *arr2 = (int *)malloc(3 * sizeof(int));
-    for (int i = 0; i < 3; ++i) {
-        arr2[i] = i * 3;
-    }
-    printf("Array 2: ");
-    for (int i = 0; i < 3; ++i) {
-        printf("%d ", arr2[i]);
-    }
-    printf("\n");
-    int *arr3 = (int *)realloc(arr2, 5 * sizeof(int));
-    for (int i = 3; i < 5; ++i) {
-        arr3[i] = i * 4;
-    }
-    printf("Array 3: ");
-    for (int i = 0; i < 5; ++i) {
-        printf("%d ", arr3[i]);
-    }
-    printf("\n");
-    free(arr3);
-    return 0;
-}
-*/
