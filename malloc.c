@@ -8,12 +8,50 @@
 typedef struct Header {
     size_t size;
     struct Header* next;
+    struct Header* prev;
     int is_free;
 } header_t;
 
 static header_t* head = NULL;
 static header_t* tail = NULL;
 static pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void add_to_free_list(header_t* block) {
+    block->is_free = 1;
+    block->next = head;
+    if (head) {
+        head->prev = block;
+    }
+    head = block;
+    if (!tail) {
+        tail = head;
+    }
+}
+
+void remove_from_free_list(header_t* block) {
+    if (block->prev) {
+        block->prev->next = block->next;
+    } else {
+        head = block->next;
+    }
+    if (block->next) {
+        block->next->prev = block->prev;
+    } else {
+        tail = block->prev;
+    }
+}
+
+header_t* get_free_block(size_t size) {
+    header_t* curr = head;
+    while (curr) {
+        if (curr->is_free && curr->size >= size) {
+            remove_from_free_list(curr);
+            return curr;
+        }
+        curr = curr->next;
+    }
+    return NULL;
+}
 
 void* malloc(size_t size) {
     size_t total_size;
@@ -23,6 +61,12 @@ void* malloc(size_t size) {
         return NULL;
     }
     pthread_mutex_lock(&global_malloc_lock);
+    header = get_free_block(size);
+    if (header) {
+        header->is_free = 0;
+        pthread_mutex_unlock(&global_malloc_lock);
+        return (void*)(header + 1);
+    }
     total_size = size + sizeof(header_t);
     header = sbrk(total_size);
     if (header == (void*) -1) {
@@ -31,12 +75,14 @@ void* malloc(size_t size) {
     }
     header->size = size;
     header->next = NULL;
+    header->prev = NULL;
     header->is_free = 0;
-    if (head == NULL) {
-        head = tail = header;
-    } else {
+    if (tail) {
         tail->next = header;
+        header->prev = tail;
         tail = header;
+    } else {
+        head = tail = header;
     }
     block = (void*)(header + 1);
     pthread_mutex_unlock(&global_malloc_lock);
@@ -58,7 +104,6 @@ void* realloc(void* block, size_t size) {
         memmove(ret, block, header->size);
         free(block);
     }
-
     return ret;
 }
 
@@ -86,7 +131,7 @@ void free(void* block) {
         }
         sbrk(0 - sizeof(header_t) - header->size);
     } else {
-        header->is_free = 1;
+        add_to_free_list(header);
     }
 
     pthread_mutex_unlock(&global_malloc_lock);
