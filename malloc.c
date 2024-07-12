@@ -5,7 +5,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-#define NUM_FREE_LISTS 10
+#define ALIGNMENT 8
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
+#define POOL_SIZE 1024 * 1024 // 1 MB
 
 typedef struct Header {
     size_t size;
@@ -14,63 +16,52 @@ typedef struct Header {
     int is_free;
 } header_t;
 
-static header_t* free_lists[NUM_FREE_LISTS] = {NULL};
-static pthread_mutex_t free_list_locks[NUM_FREE_LISTS] = {PTHREAD_MUTEX_INITIALIZER};
-static pthread_mutex_t global_sbrk_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    header_t* head;
+    header_t* tail;
+    size_t allocated_memory;
+    size_t free_memory;
+} memory_pool_t;
 
-size_t get_free_list_index(size_t size) {
-    size_t index = 0;
-    size_t temp_size = size;
-    while (temp_size >>= 1) {
-        index++;
-    }
-    return (index < NUM_FREE_LISTS) ? index : NUM_FREE_LISTS - 1;
-}
+static memory_pool_t global_pool = {NULL, NULL, 0, 0};
+static pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static void* pool_start = NULL;
 
 void add_to_free_list(header_t* block) {
-    size_t index = get_free_list_index(block->size);
-    pthread_mutex_lock(&free_list_locks[index]);
-
     block->is_free = 1;
-    block->next = free_lists[index];
-    if (free_lists[index]) {
-        free_lists[index]->prev = block;
+    block->next = global_pool.head;
+    if (global_pool.head) {
+        global_pool.head->prev = block;
     }
-    free_lists[index] = block;
-
-    pthread_mutex_unlock(&free_list_locks[index]);
+    global_pool.head = block;
+    if (!global_pool.tail) {
+        global_pool.tail = global_pool.head;
+    }
+    global_pool.free_memory += block->size;
 }
 
 void remove_from_free_list(header_t* block) {
-    size_t index = get_free_list_index(block->size);
-    pthread_mutex_lock(&free_list_locks[index]);
-
     if (block->prev) {
         block->prev->next = block->next;
     } else {
-        free_lists[index] = block->next;
+        global_pool.head = block->next;
     }
     if (block->next) {
         block->next->prev = block->prev;
+    } else {
+        global_pool.tail = block->prev;
     }
-
-    pthread_mutex_unlock(&free_list_locks[index]);
+    global_pool.free_memory -= block->size;
 }
 
 header_t* get_free_block(size_t size) {
-    size_t index = get_free_list_index(size);
-    for (; index < NUM_FREE_LISTS; ++index) {
-        pthread_mutex_lock(&free_list_locks[index]);
-        header_t* curr = free_lists[index];
-        while (curr) {
-            if (curr->is_free && curr->size >= size) {
-                remove_from_free_list(curr);
-                pthread_mutex_unlock(&free_list_locks[index]);
-                return curr;
-            }
-            curr = curr->next;
+    header_t* curr = global_pool.head;
+    while (curr) {
+        if (curr->is_free && curr->size >= size) {
+            remove_from_free_list(curr);
+            return curr;
         }
-        pthread_mutex_unlock(&free_list_locks[index]);
+        curr = curr->next;
     }
     return NULL;
 }
@@ -79,43 +70,70 @@ void* malloc(size_t size) {
     size_t total_size;
     void* block;
     header_t* header;
+
     if (size == 0) {
         return NULL;
     }
+
+    size = ALIGN(size);
+    pthread_mutex_lock(&global_malloc_lock);
     header = get_free_block(size);
     if (header) {
         header->is_free = 0;
+        pthread_mutex_unlock(&global_malloc_lock);
         return (void*)(header + 1);
     }
-    pthread_mutex_lock(&global_sbrk_lock);
+
     total_size = size + sizeof(header_t);
-    header = sbrk(total_size);
-    if (header == (void*) -1) {
-        pthread_mutex_unlock(&global_sbrk_lock);
+    if (!pool_start || (char*)sbrk(0) - (char*)pool_start + total_size > POOL_SIZE) {
+        pthread_mutex_unlock(&global_malloc_lock);
         return NULL;
     }
+
+    header = sbrk(total_size);
+    if (header == (void*) -1) {
+        pthread_mutex_unlock(&global_malloc_lock);
+        return NULL;
+    }
+
     header->size = size;
     header->next = NULL;
     header->prev = NULL;
     header->is_free = 0;
-    pthread_mutex_unlock(&global_sbrk_lock);
+
+    if (global_pool.tail) {
+        global_pool.tail->next = header;
+        header->prev = global_pool.tail;
+        global_pool.tail = header;
+    } else {
+        global_pool.head = global_pool.tail = header;
+    }
+
+    global_pool.allocated_memory += size;
     block = (void*)(header + 1);
+    pthread_mutex_unlock(&global_malloc_lock);
     return block;
 }
 
 void* realloc(void* block, size_t size) {
     header_t* header;
     void* ret;
-    if (!block || size == 0) {
+    if (!block) {
         return malloc(size);
     }
+    if (size == 0) {
+        free(block);
+        return NULL;
+    }
+
     header = (header_t*)block - 1;
     if (header->size >= size) {
         return block;
     }
+
     ret = malloc(size);
     if (ret) {
-        memmove(ret, block, header->size);
+        memcpy(ret, block, header->size);
         free(block);
     }
     return ret;
@@ -127,68 +145,57 @@ void free(void* block) {
     if (!block) {
         return;
     }
+
+    pthread_mutex_lock(&global_malloc_lock);
     header = (header_t*)block - 1;
 
-    pthread_mutex_lock(&global_sbrk_lock);
     programbreak = sbrk(0);
     if ((char*)block + header->size == programbreak) {
+        if (global_pool.head == global_pool.tail) {
+            global_pool.head = global_pool.tail = NULL;
+        } else {
+            tmp = global_pool.head;
+            while (tmp->next != global_pool.tail) {
+                tmp = tmp->next;
+            }
+            tmp->next = NULL;
+            global_pool.tail = tmp;
+        }
         sbrk(0 - sizeof(header_t) - header->size);
-        pthread_mutex_unlock(&global_sbrk_lock);
-        return;
+    } else {
+        add_to_free_list(header);
     }
-    pthread_mutex_unlock(&global_sbrk_lock);
 
-    add_to_free_list(header);
+    pthread_mutex_unlock(&global_malloc_lock);
 }
 
 void* calloc(size_t num, size_t nsize) {
     size_t size;
     void* block;
+
     if (!num || !nsize) {
         return NULL;
     }
+
     size = num * nsize;
     if (nsize != size / num) {
         return NULL;
     }
+
     block = malloc(size);
-    if (!block) {
-        return NULL;
+    if (block) {
+        memset(block, 0, size);
     }
-    memset(block, 0, size);
     return block;
 }
 
+// debugging
 size_t get_allocated_memory() {
-    size_t total = 0;
-    for (int i = 0; i < NUM_FREE_LISTS; ++i) {
-        pthread_mutex_lock(&free_list_locks[i]);
-        header_t* curr = free_lists[i];
-        while (curr) {
-            if (!curr->is_free) {
-                total += curr->size;
-            }
-            curr = curr->next;
-        }
-        pthread_mutex_unlock(&free_list_locks[i]);
-    }
-    return total;
+    return global_pool.allocated_memory;
 }
 
 size_t get_free_memory() {
-    size_t total = 0;
-    for (int i = 0; i < NUM_FREE_LISTS; ++i) {
-        pthread_mutex_lock(&free_list_locks[i]);
-        header_t* curr = free_lists[i];
-        while (curr) {
-            if (curr->is_free) {
-                total += curr->size;
-            }
-            curr = curr->next;
-        }
-        pthread_mutex_unlock(&free_list_locks[i]);
-    }
-    return total;
+    return global_pool.free_memory;
 }
 
 void print_memory_usage() {
@@ -196,8 +203,36 @@ void print_memory_usage() {
     printf("Free memory: %zu bytes\n", get_free_memory());
 }
 
+void initialize_memory_pool() {
+    pthread_mutex_lock(&global_malloc_lock);
+    if (!pool_start) {
+        pool_start = sbrk(POOL_SIZE);
+        if (pool_start == (void*)-1) {
+            pool_start = NULL;
+        }
+    }
+    pthread_mutex_unlock(&global_malloc_lock);
+}
+
 /*
-test program
+test program 1
+
+int main() {
+    initialize_memory_pool();
+    int* arr = (int*)malloc(10 * sizeof(int));
+    if (arr) {
+        for (int i = 0; i < 10; i++) {
+            arr[i] = i;
+        }
+        free(arr);
+    }
+    print_memory_usage();
+    return 0;
+}
+*/
+
+/*
+test program 2
 
 #include <stdio.h>
 #include <stdlib.h>
