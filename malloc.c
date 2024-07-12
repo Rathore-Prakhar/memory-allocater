@@ -66,6 +66,27 @@ header_t* get_free_block(size_t size) {
     return NULL;
 }
 
+void split_block(header_t* block, size_t size) {
+    if (block->size >= size + sizeof(header_t) + ALIGNMENT) {
+        header_t* new_block = (header_t*)((char*)block + sizeof(header_t) + size);
+        new_block->size = block->size - size - sizeof(header_t);
+        block->size = size;
+        add_to_free_list(new_block);
+    }
+}
+
+void coalesce_free_blocks() {
+    header_t* curr = global_pool.head;
+    while (curr && curr->next) {
+        if ((char*)curr + curr->size + sizeof(header_t) == (char*)curr->next) {
+            curr->size += curr->next->size + sizeof(header_t);
+            remove_from_free_list(curr->next);
+        } else {
+            curr = curr->next;
+        }
+    }
+}
+
 void* malloc(size_t size) {
     size_t total_size;
     void* block;
@@ -79,6 +100,7 @@ void* malloc(size_t size) {
     pthread_mutex_lock(&global_malloc_lock);
     header = get_free_block(size);
     if (header) {
+        split_block(header, size);
         header->is_free = 0;
         pthread_mutex_unlock(&global_malloc_lock);
         return (void*)(header + 1);
@@ -164,6 +186,7 @@ void free(void* block) {
         sbrk(0 - sizeof(header_t) - header->size);
     } else {
         add_to_free_list(header);
+        coalesce_free_blocks();
     }
 
     pthread_mutex_unlock(&global_malloc_lock);
@@ -203,6 +226,15 @@ void print_memory_usage() {
     printf("Free memory: %zu bytes\n", get_free_memory());
 }
 
+void print_free_list() {
+    header_t* curr = global_pool.head;
+    printf("Free list:\n");
+    while (curr) {
+        printf("Block at %p, size: %zu\n", (void*)curr, curr->size);
+        curr = curr->next;
+    }
+}
+
 void initialize_memory_pool() {
     pthread_mutex_lock(&global_malloc_lock);
     if (!pool_start) {
@@ -227,6 +259,7 @@ int main() {
         free(arr);
     }
     print_memory_usage();
+    print_free_list();
     return 0;
 }
 */
